@@ -404,10 +404,26 @@ func TestServiceGitHubCompletionModeRepairsPublishConflict(t *testing.T) {
 	publisher := &fakePullRequestPublisher{
 		errOnce: errors.New("remote patch has conflicts or no longer applies cleanly; patch does not apply"),
 	}
-	service := NewServiceWithWorkspaceManager(store, fixedBrain{plan: Plan{
-		WorkerKind: "change",
-		Prompt:     "make change",
-	}}, map[string]worker.Runner{
+	brain := &replanningBrain{
+		plan: Plan{
+			WorkerKind: "change",
+			Prompt:     "make change",
+		},
+		decisions: []ReplanDecision{{
+			Action:    "complete",
+			Rationale: "initial candidate is ready",
+		}, {
+			Action: "continue",
+			Plan: &Plan{
+				WorkerKind: "change",
+				Prompt:     "repair publish conflict against current checkout",
+			},
+		}, {
+			Action:    "complete",
+			Rationale: "repair worker is final",
+		}},
+	}
+	service := NewServiceWithWorkspaceManager(store, brain, map[string]worker.Runner{
 		"change": eventRunner{kind: "change", events: []worker.Event{{Kind: worker.EventResult, Text: "implemented"}}},
 	}, t.TempDir(), fakeWorkspaceManager{
 		cwd:        t.TempDir(),
@@ -432,6 +448,9 @@ func TestServiceGitHubCompletionModeRepairsPublishConflict(t *testing.T) {
 	snapshot := waitForTaskStatus(t, store, task.ID, core.TaskWaiting)
 	if len(snapshot.PullRequests) != 1 {
 		t.Fatalf("pull requests = %+v", snapshot.PullRequests)
+	}
+	if !replanStatesContainResultError(brain.states, "completion publish failed") {
+		t.Fatalf("replan states did not include publish failure context: %+v", brain.states)
 	}
 	if publisher.publishCalls != 2 {
 		t.Fatalf("publish calls = %d, want 2", publisher.publishCalls)
@@ -2379,10 +2398,26 @@ func TestServiceRepairsFinalTaskCandidateApplyConflict(t *testing.T) {
 
 	changed := WorkspaceChangedFile{Path: "web/src/main.tsx", Status: "modified"}
 	applyCalls := 0
-	service := NewServiceWithWorkspaceManager(store, fixedBrain{plan: Plan{
-		WorkerKind: "writer",
-		Prompt:     "worker prompt",
-	}}, map[string]worker.Runner{"writer": fileWritingRunner{
+	brain := &replanningBrain{
+		plan: Plan{
+			WorkerKind: "writer",
+			Prompt:     "worker prompt",
+		},
+		decisions: []ReplanDecision{{
+			Action:    "complete",
+			Rationale: "initial candidate is ready",
+		}, {
+			Action: "continue",
+			Plan: &Plan{
+				WorkerKind: "writer",
+				Prompt:     "repair local apply conflict against current checkout",
+			},
+		}, {
+			Action:    "complete",
+			Rationale: "repair worker is final",
+		}},
+	}
+	service := NewServiceWithWorkspaceManager(store, brain, map[string]worker.Runner{"writer": fileWritingRunner{
 		kind: "writer",
 		path: changed.Path,
 		body: "worker output\n",
@@ -2410,6 +2445,9 @@ func TestServiceRepairsFinalTaskCandidateApplyConflict(t *testing.T) {
 	result, err := service.ApplyTaskResult(ctx, task.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !replanStatesContainResultError(brain.states, "local apply failed") {
+		t.Fatalf("replan states did not include local apply failure context: %+v", brain.states)
 	}
 	if result.WorkerID == "" || result.WorkerID == originalCandidate {
 		t.Fatalf("applied worker = %q, want repaired worker distinct from %q", result.WorkerID, originalCandidate)
@@ -4766,6 +4804,24 @@ func hasTaskAction(events []core.Event, taskID string, kind string, status strin
 			continue
 		}
 		if payload.Kind == kind && payload.Status == status {
+			return true
+		}
+	}
+	return false
+}
+
+func resultErrorContains(results []WorkerTurnResult, needle string) bool {
+	for _, result := range results {
+		if strings.Contains(result.Error, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func replanStatesContainResultError(states []OrchestrationState, needle string) bool {
+	for _, state := range states {
+		if resultErrorContains(state.Results, needle) {
 			return true
 		}
 	}
