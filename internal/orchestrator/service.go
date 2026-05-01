@@ -3658,12 +3658,22 @@ func (s *Service) runFollowUpWave(ctx context.Context, task core.Task, initial P
 
 	type outcome struct {
 		index  int
+		plan   Plan
 		result WorkerTurnResult
 		err    error
 	}
 	outcomes := make(chan outcome, len(nodes))
 	for index, node := range nodes {
 		followUp := s.followUpPlan(task, initial, node.spawn, priorResults, node.index+2, node.id, node.deps, parentNodeID)
+		if followUp.Metadata == nil {
+			followUp.Metadata = map[string]any{}
+		}
+		if stringMetadata(followUp.Metadata, "nodeID") == "" {
+			followUp.Metadata["nodeID"] = uuid.NewString()
+		}
+		if stringMetadata(followUp.Metadata, "planID") == "" {
+			followUp.Metadata["planID"] = uuid.NewString()
+		}
 		if _, err := s.append(ctx, core.Event{
 			Type:    core.EventTaskPlanned,
 			TaskID:  task.ID,
@@ -3673,24 +3683,34 @@ func (s *Service) runFollowUpWave(ctx context.Context, task core.Task, initial P
 		}
 		go func(index int, plan Plan) {
 			result, err := s.runPlannedWorker(waveCtx, task, plan)
-			outcomes <- outcome{index: index, result: result, err: err}
+			outcomes <- outcome{index: index, plan: plan, result: result, err: err}
 		}(index, followUp)
 	}
 
 	ordered := make([]WorkerTurnResult, len(nodes))
-	var firstErr error
 	for range nodes {
 		outcome := <-outcomes
-		ordered[outcome.index] = outcome.result
-		if outcome.err != nil && firstErr == nil {
-			firstErr = outcome.err
-			cancel()
+		if outcome.err != nil {
+			ordered[outcome.index] = failedFollowUpResult(outcome.plan, outcome.err)
+			continue
 		}
-	}
-	if firstErr != nil {
-		return ordered, false, firstErr
+		ordered[outcome.index] = outcome.result
 	}
 	return ordered, true, nil
+}
+
+func failedFollowUpResult(plan Plan, err error) WorkerTurnResult {
+	result := WorkerTurnResult{
+		NodeID:       stringMetadata(plan.Metadata, "nodeID"),
+		Status:       core.WorkerFailed,
+		Kind:         plan.WorkerKind,
+		Role:         stringMetadata(plan.Metadata, "spawnRole"),
+		SpawnID:      stringMetadata(plan.Metadata, "spawnID"),
+		BaseWorkerID: stringMetadata(plan.Metadata, "baseWorkerID"),
+		Summary:      "Follow-up worker setup failed before execution.",
+		Error:        err.Error(),
+	}
+	return result
 }
 
 func (s *Service) followUpPlan(task core.Task, initial Plan, spawn SpawnRequest, results []WorkerTurnResult, turn int, spawnID string, dependsOn []string, parentNodeID string) Plan {

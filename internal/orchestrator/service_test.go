@@ -2676,6 +2676,58 @@ func TestServiceContinuesAfterFailedFollowUpWorker(t *testing.T) {
 	}
 }
 
+func TestServiceContinuesAfterFollowUpSetupError(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+
+	prepareCalls := 0
+	workspaceErr := errors.New("apply base worker patch in local workspace: corrupt patch")
+	brain := &replanningBrain{plan: Plan{
+		WorkerKind: "codex",
+		Prompt:     "implement the first bounded refactor slice",
+		Spawns: []SpawnRequest{{
+			ID:         "review",
+			Role:       "reviewer",
+			Reason:     "Review the implementation output.",
+			WorkerKind: "reviewer",
+		}},
+	}}
+	service := NewServiceWithWorkspaceManager(store, brain, map[string]worker.Runner{
+		"codex":    eventRunner{kind: "codex", events: []worker.Event{{Kind: worker.EventResult, Text: "implemented"}}},
+		"reviewer": eventRunner{kind: "reviewer", events: []worker.Event{{Kind: worker.EventResult, Text: "reviewed"}}},
+	}, t.TempDir(), fakeWorkspaceManager{
+		cwd:              t.TempDir(),
+		prepareCalls:     &prepareCalls,
+		failPrepareAfter: 1,
+		prepareErr:       workspaceErr,
+		changes: WorkspaceChanges{
+			Dirty:        true,
+			ChangedFiles: []WorkspaceChangedFile{{Path: "internal/refactor.go", Status: "modified"}},
+		},
+	})
+
+	task, err := service.CreateTask(ctx, core.CreateTaskRequest{
+		Title:  "Recover failed setup",
+		Prompt: "Implement, then review the candidate.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := waitForTaskStatus(t, store, task.ID, core.TaskSucceeded)
+	if len(brain.states) != 1 || len(brain.states[0].Results) != 2 {
+		t.Fatalf("replan states = %+v", brain.states)
+	}
+	followUp := brain.states[0].Results[1]
+	if followUp.Status != core.WorkerFailed || !strings.Contains(followUp.Error, "corrupt patch") {
+		t.Fatalf("follow-up result = %+v", followUp)
+	}
+	if countEvents(snapshot.Events, core.EventTaskStatus, task.ID) == 0 {
+		t.Fatalf("missing task status events")
+	}
+}
+
 func TestServiceBasesFollowUpWorkspaceOnLatestCandidate(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -4317,6 +4369,10 @@ type fakeWorkspaceManager struct {
 	diff         string
 	applyCalls   *int
 	diffCalls    *int
+	prepareCalls *int
+	prepareErr   error
+
+	failPrepareAfter int
 }
 
 type recordingWorkspaceManager struct {
@@ -4392,6 +4448,12 @@ func (m *recordingWorkspaceManager) ApplyChanges(_ context.Context, workspace Pr
 }
 
 func (m fakeWorkspaceManager) Prepare(_ context.Context, spec WorkspaceSpec) (PreparedWorkspace, error) {
+	if m.prepareCalls != nil {
+		*m.prepareCalls = *m.prepareCalls + 1
+		if m.prepareErr != nil && m.failPrepareAfter > 0 && *m.prepareCalls > m.failPrepareAfter {
+			return PreparedWorkspace{}, m.prepareErr
+		}
+	}
 	sourceRoot := m.sourceRoot
 	mode := string(WorkspaceModeShared)
 	if sourceRoot == "" {
