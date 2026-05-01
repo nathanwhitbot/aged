@@ -226,7 +226,13 @@ func (d *GitHubDriver) monitorPullRequests(ctx context.Context) error {
 	}
 	var errs []string
 	for _, pr := range snapshot.PullRequests {
-		if !d.monitorsPullRequestRepo(pr.Repo) || strings.EqualFold(pr.State, "MERGED") || strings.EqualFold(pr.State, "CLOSED") {
+		if !d.monitorsPullRequestRepo(pr.Repo) {
+			continue
+		}
+		if strings.EqualFold(pr.State, "MERGED") || strings.EqualFold(pr.State, "CLOSED") {
+			if err := d.service.ReconcilePullRequestTerminalTasks(ctx, pr.ID); err != nil {
+				errs = append(errs, fmt.Sprintf("%s reconcile terminal pr: %v", pr.ID, err))
+			}
 			continue
 		}
 		checked, err := d.service.RefreshPullRequest(ctx, pr.ID)

@@ -1127,9 +1127,18 @@ func (s *Service) RefreshPullRequest(ctx context.Context, prID string) (core.Pul
 	if s.prPublisher == nil {
 		return core.PullRequest{}, errors.New("pull request publisher is not configured")
 	}
-	pr, ok, err := s.findPullRequest(ctx, prID)
+	snapshot, err := s.store.Snapshot(ctx)
 	if err != nil {
 		return core.PullRequest{}, err
+	}
+	var pr core.PullRequest
+	var ok bool
+	for _, candidate := range snapshot.PullRequests {
+		if candidate.ID == prID {
+			pr = candidate
+			ok = true
+			break
+		}
 	}
 	if !ok {
 		return core.PullRequest{}, eventstore.ErrNotFound
@@ -1178,6 +1187,9 @@ func (s *Service) RefreshPullRequest(ctx context.Context, prID string) (core.Pul
 		if err := s.setTaskStatus(ctx, checked.TaskID, core.TaskSucceeded); err != nil {
 			return core.PullRequest{}, err
 		}
+		if err := s.completeRelatedPullRequestTasks(ctx, snapshot, checked, core.TaskSucceeded, core.ObjectiveSatisfied, "pr_merged", "merged", "Pull request merged."); err != nil {
+			return core.PullRequest{}, err
+		}
 	} else if strings.EqualFold(checked.State, "CLOSED") {
 		if err := s.recordTaskMilestone(ctx, checked.TaskID, "pr_closed", "pr_closed", "Pull request closed without merge.", map[string]any{
 			"pullRequestId": checked.ID,
@@ -1190,8 +1202,77 @@ func (s *Service) RefreshPullRequest(ctx context.Context, prID string) (core.Pul
 		if err := s.setTaskStatus(ctx, checked.TaskID, core.TaskCanceled); err != nil {
 			return core.PullRequest{}, err
 		}
+		if err := s.completeRelatedPullRequestTasks(ctx, snapshot, checked, core.TaskCanceled, core.ObjectiveAbandoned, "pr_closed", "pr_closed", "Pull request closed without merge."); err != nil {
+			return core.PullRequest{}, err
+		}
 	}
 	return checked, nil
+}
+
+func (s *Service) ReconcilePullRequestTerminalTasks(ctx context.Context, prID string) error {
+	snapshot, err := s.store.Snapshot(ctx)
+	if err != nil {
+		return err
+	}
+	var pr core.PullRequest
+	var ok bool
+	for _, candidate := range snapshot.PullRequests {
+		if candidate.ID == prID {
+			pr = candidate
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return eventstore.ErrNotFound
+	}
+	switch {
+	case strings.EqualFold(pr.State, "MERGED"):
+		return s.completeRelatedPullRequestTasks(ctx, snapshot, pr, core.TaskSucceeded, core.ObjectiveSatisfied, "pr_merged", "merged", "Pull request merged.")
+	case strings.EqualFold(pr.State, "CLOSED"):
+		return s.completeRelatedPullRequestTasks(ctx, snapshot, pr, core.TaskCanceled, core.ObjectiveAbandoned, "pr_closed", "pr_closed", "Pull request closed without merge.")
+	default:
+		return nil
+	}
+}
+
+func (s *Service) completeRelatedPullRequestTasks(ctx context.Context, snapshot core.Snapshot, pr core.PullRequest, taskStatus core.TaskStatus, objectiveStatus core.ObjectiveStatus, milestone string, phase string, summary string) error {
+	for _, task := range snapshot.Tasks {
+		if task.ID == pr.TaskID || isTerminalTaskStatus(task.Status) || !taskWatchesPullRequest(task, pr) {
+			continue
+		}
+		if err := s.updateTaskObjective(ctx, task.ID, objectiveStatus, phase, summary); err != nil {
+			return err
+		}
+		if err := s.recordTaskMilestone(ctx, task.ID, milestone, phase, summary, map[string]any{
+			"pullRequestId": pr.ID,
+			"url":           pr.URL,
+			"repo":          pr.Repo,
+			"number":        pr.Number,
+		}); err != nil {
+			return err
+		}
+		if err := s.setTaskStatus(ctx, task.ID, taskStatus); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func taskWatchesPullRequest(task core.Task, pr core.PullRequest) bool {
+	if len(task.Metadata) == 0 {
+		return false
+	}
+	var metadata map[string]any
+	if err := json.Unmarshal(task.Metadata, &metadata); err != nil {
+		return false
+	}
+	if pullRequestID := strings.TrimSpace(stringMetadataValue(metadata["pullRequestId"])); pullRequestID != "" && pullRequestID == pr.ID {
+		return true
+	}
+	repo := strings.TrimSpace(stringMetadataValue(metadata["repo"]))
+	number := intMetadata(metadata, "number")
+	return repo != "" && pr.Repo != "" && strings.EqualFold(repo, pr.Repo) && number > 0 && number == pr.Number
 }
 
 func (s *Service) StartPullRequestBabysitter(ctx context.Context, prID string) (core.Task, error) {
@@ -1211,35 +1292,32 @@ func (s *Service) StartPullRequestBabysitter(ctx context.Context, prID string) (
 	if !ok {
 		return core.Task{}, eventstore.ErrNotFound
 	}
-	if active := activePullRequestBabysitter(snapshot, pr); active.ID != "" {
-		return active, nil
+	task, ok := findTask(snapshot, pr.TaskID)
+	if !ok {
+		return core.Task{}, eventstore.ErrNotFound
 	}
-	attempt := pullRequestBabysitterAttempt(snapshot, pr.ID) + 1
-	task, err := s.CreateTask(ctx, core.CreateTaskRequest{
-		Title:      fmt.Sprintf("Babysit PR %s#%d", pr.Repo, pr.Number),
-		Prompt:     pullRequestBabysitterPrompt(pr),
-		Source:     "github-pr-babysitter",
-		ExternalID: fmt.Sprintf("%s:%d", pr.ID, attempt),
-		Metadata: core.MustJSON(map[string]any{
-			"pullRequestId": pr.ID,
-			"repo":          pr.Repo,
-			"number":        pr.Number,
-			"url":           pr.URL,
-			"attempt":       attempt,
-		}),
-	})
-	if err != nil {
-		return core.Task{}, err
+	if isTerminalTaskStatus(task.Status) && !strings.EqualFold(pr.State, "OPEN") {
+		return task, nil
 	}
 	if _, err := s.append(ctx, core.Event{
 		Type:   core.EventPRBabysitter,
 		TaskID: pr.TaskID,
 		Payload: core.MustJSON(map[string]any{
 			"id":               pr.ID,
-			"babysitterTaskId": task.ID,
+			"babysitterTaskId": pr.TaskID,
 		}),
 	}); err != nil {
 		return core.Task{}, err
+	}
+	if !isTerminalTaskStatus(task.Status) {
+		if err := s.updateTaskObjective(ctx, task.ID, core.ObjectiveWaitingExternal, "pr_open", "Pull request is open; waiting on external GitHub state."); err != nil {
+			return core.Task{}, err
+		}
+		if task.Status != core.TaskWaiting {
+			if err := s.setTaskStatus(ctx, task.ID, core.TaskWaiting); err != nil {
+				return core.Task{}, err
+			}
+		}
 	}
 	return task, nil
 }

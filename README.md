@@ -110,7 +110,7 @@ The built-in GitHub driver is enabled separately with `-github-driver` / `AGED_G
 }
 ```
 
-On each poll, the driver creates idempotent tasks for matching GitHub issues, publishes PRs for succeeded GitHub issue tasks that do not already have a PR, refreshes known PR status, and starts a PR babysitter task when checks fail, reviews request changes, or mergeability is blocked/dirty. It does not merge PRs automatically.
+On each poll, the driver creates idempotent tasks for matching GitHub issues, publishes PRs for succeeded GitHub issue tasks that do not already have a PR, refreshes known PR status, and steers the original PR task when checks fail, reviews request changes, or mergeability is blocked/dirty. It does not merge PRs automatically.
 
 The built-in Discord driver is enabled with `-discord-driver` / `AGED_DISCORD_DRIVER`, which accepts a JSON file path or inline JSON. It polls configured channels with a Discord bot token, answers normal messages through the configured aged assistant, and can either answer, propose a task for later confirmation, or directly create a task when the conversation clearly asks aged to start work. `task: <prompt>` and a later `do it` reply remain supported shortcuts. If the assistant is not configured for useful conversational answers, the driver still lets `do it` create a task from the prior Discord message.
 
@@ -208,7 +208,7 @@ Scheduler behavior:
 - Retained isolated workspace changes can be reviewed with `GET /api/workers/{id}/changes` and applied back to the source checkout with `POST /api/workers/{id}/apply`. Jujutsu apply creates a new merge revision with source `@` and the worker workspace revision as parents; Git apply commits the worker worktree and merges that commit. Apply records `worker.changes_applied`.
 - Apply policy recommendations can be requested with `POST /api/tasks/{id}/apply-policy`; the service reports whether there are no candidates, exactly one candidate, or multiple competing candidates requiring manual selection or review.
 - Applied task changes can be published as GitHub pull requests with `POST /api/tasks/{id}/pull-request`. If exactly one successful worker has unapplied changes, the service applies it first, creates/pushes a branch from the source checkout, opens the PR with `gh`, and records `pull_request.published`.
-- Pull request state is first-class snapshot data. `POST /api/pull-requests/{id}/refresh` re-inspects CI/review/merge state, and `POST /api/pull-requests/{id}/babysit` schedules a normal orchestrated task to monitor the PR and address failing checks or review comments.
+- Pull request state is first-class snapshot data. `POST /api/pull-requests/{id}/refresh` re-inspects CI/review/merge state, and `POST /api/pull-requests/{id}/babysit` marks the original PR task for monitoring so later checks or review comments steer that same task.
 - Running workers receive task steering through `worker.Spec.Steering` when a runner supports it. The built-in Codex and Claude exec adapters do not hold stdin open for steering because those CLIs treat piped stdin as extra initial prompt input and may wait indefinitely.
 - Failed or canceled tasks can be retried with `POST /api/tasks/{id}/retry`; retry reuses the persisted plan on the same task id and runs the normal follow-up/replan flow again. This is intended to recover tasks that were marked canceled after a daemon restart.
 - `benchmark_compare` compares explicit `baseline`, `candidate`, `threshold_percent`, and `higher_is_better` prompt fields and emits a benchmark comparison report.

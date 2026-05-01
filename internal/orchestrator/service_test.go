@@ -549,6 +549,147 @@ func TestServiceRefreshPullRequestCanSatisfyTaskObjective(t *testing.T) {
 	}
 }
 
+func TestServiceRefreshPullRequestCompletesLegacyBabysitterTask(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+
+	publisher := &fakePullRequestPublisher{status: core.PullRequest{
+		ID:           "github:owner/repo#7",
+		Repo:         "owner/repo",
+		Number:       7,
+		URL:          "https://github.com/owner/repo/pull/7",
+		Branch:       "codex/aged-test",
+		Base:         "main",
+		Title:        "Task",
+		State:        "MERGED",
+		ChecksStatus: "success",
+		MergeStatus:  "UNKNOWN",
+	}}
+	service := NewServiceWithWorkspaceManager(store, fixedBrain{plan: Plan{WorkerKind: "mock", Prompt: "noop"}}, map[string]worker.Runner{
+		"mock": eventRunner{kind: "mock", events: []worker.Event{{Kind: worker.EventResult, Text: "ready"}}},
+	}, t.TempDir(), fakeWorkspaceManager{cwd: t.TempDir()})
+	service.SetPullRequestPublisher(publisher)
+	for _, task := range []struct {
+		id       string
+		metadata map[string]any
+	}{
+		{id: "task-1"},
+		{id: "babysitter-1", metadata: map[string]any{"pullRequestId": "github:owner/repo#7", "repo": "owner/repo", "number": 7}},
+	} {
+		if _, err := store.Append(ctx, core.Event{
+			Type:   core.EventTaskCreated,
+			TaskID: task.id,
+			Payload: core.MustJSON(map[string]any{
+				"title":    "Task",
+				"prompt":   "Prompt",
+				"metadata": task.metadata,
+			}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Append(ctx, core.Event{
+			Type:   core.EventTaskStatus,
+			TaskID: task.id,
+			Payload: core.MustJSON(map[string]any{
+				"status": core.TaskWaiting,
+			}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Append(ctx, core.Event{
+		Type:   core.EventPRPublished,
+		TaskID: "task-1",
+		Payload: core.MustJSON(map[string]any{
+			"id":     "github:owner/repo#7",
+			"repo":   "owner/repo",
+			"number": 7,
+			"url":    "https://github.com/owner/repo/pull/7",
+			"branch": "codex/aged-test",
+			"base":   "main",
+			"title":  "Task",
+			"state":  "OPEN",
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.RefreshPullRequest(ctx, "github:owner/repo#7"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := waitForTaskStatus(t, store, "babysitter-1", core.TaskSucceeded)
+	babysitter, ok := findTask(snapshot, "babysitter-1")
+	if !ok {
+		t.Fatal("missing babysitter task")
+	}
+	if babysitter.ObjectiveStatus != core.ObjectiveSatisfied || babysitter.ObjectivePhase != "merged" {
+		t.Fatalf("babysitter objective = %q phase %q", babysitter.ObjectiveStatus, babysitter.ObjectivePhase)
+	}
+	if !hasMilestone(babysitter.Milestones, "pr_merged") {
+		t.Fatalf("babysitter milestones = %+v", babysitter.Milestones)
+	}
+}
+
+func TestServiceReconcilesTerminalPullRequestLegacyBabysitterTask(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+
+	service := NewServiceWithWorkspaceManager(store, fixedBrain{plan: Plan{WorkerKind: "mock", Prompt: "noop"}}, map[string]worker.Runner{
+		"mock": eventRunner{kind: "mock", events: []worker.Event{{Kind: worker.EventResult, Text: "ready"}}},
+	}, t.TempDir(), fakeWorkspaceManager{cwd: t.TempDir()})
+	for _, task := range []struct {
+		id       string
+		metadata map[string]any
+	}{
+		{id: "task-1"},
+		{id: "babysitter-1", metadata: map[string]any{"pullRequestId": "github:owner/repo#7", "repo": "owner/repo", "number": 7}},
+	} {
+		if _, err := store.Append(ctx, core.Event{
+			Type:   core.EventTaskCreated,
+			TaskID: task.id,
+			Payload: core.MustJSON(map[string]any{
+				"title":    "Task",
+				"prompt":   "Prompt",
+				"metadata": task.metadata,
+			}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Append(ctx, core.Event{
+			Type:   core.EventTaskStatus,
+			TaskID: task.id,
+			Payload: core.MustJSON(map[string]any{
+				"status": core.TaskWaiting,
+			}),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.Append(ctx, core.Event{
+		Type:   core.EventPRPublished,
+		TaskID: "task-1",
+		Payload: core.MustJSON(map[string]any{
+			"id":     "github:owner/repo#7",
+			"repo":   "owner/repo",
+			"number": 7,
+			"url":    "https://github.com/owner/repo/pull/7",
+			"branch": "codex/aged-test",
+			"base":   "main",
+			"title":  "Task",
+			"state":  "MERGED",
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.ReconcilePullRequestTerminalTasks(ctx, "github:owner/repo#7"); err != nil {
+		t.Fatal(err)
+	}
+	_ = waitForTaskStatus(t, store, "babysitter-1", core.TaskSucceeded)
+}
+
 func TestServiceRoutesTaskToConfiguredProject(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
@@ -965,7 +1106,7 @@ func TestServiceRefreshesPullRequestStatus(t *testing.T) {
 	}
 }
 
-func TestServiceStartsPullRequestBabysitterTask(t *testing.T) {
+func TestServiceAttachesPullRequestBabysittingToSourceTask(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
 	defer store.Close()
@@ -982,6 +1123,15 @@ func TestServiceStartsPullRequestBabysitterTask(t *testing.T) {
 		Payload: core.MustJSON(map[string]any{
 			"title":  "Task",
 			"prompt": "Prompt",
+		}),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Append(ctx, core.Event{
+		Type:   core.EventTaskStatus,
+		TaskID: "task-1",
+		Payload: core.MustJSON(map[string]any{
+			"status": core.TaskWaiting,
 		}),
 	}); err != nil {
 		t.Fatal(err)
@@ -1007,9 +1157,9 @@ func TestServiceStartsPullRequestBabysitterTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot := waitForTaskStatus(t, store, task.ID, core.TaskSucceeded)
-	if task.ID == "task-1" {
-		t.Fatalf("babysitter reused source task id")
+	snapshot := waitForTaskStatus(t, store, task.ID, core.TaskWaiting)
+	if task.ID != "task-1" {
+		t.Fatalf("babysitter task = %q, want source task", task.ID)
 	}
 	if !hasEvent(snapshot.Events, core.EventPRBabysitter, "task-1", "") {
 		t.Fatalf("missing pr babysitter event")

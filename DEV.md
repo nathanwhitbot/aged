@@ -111,7 +111,7 @@ The initial local-first vertical slice is implemented.
 - Assistant tests verify Q&A records durable question/answer events.
 - CLI assistant tests verify Codex JSON and Claude stream output are converted into Ask responses.
 - Title-generation tests verify blank task titles use the generator and fall back locally when generation fails.
-- Pull request tests verify PR projection, status refresh, intermediate plan-action PR publication from worker workspaces without local apply, existing-PR watch task import, and legacy babysitter task scheduling.
+- Pull request tests verify PR projection, status refresh, intermediate plan-action PR publication from worker workspaces without local apply, existing-PR watch task import, same-task babysitting attachment, and legacy babysitter task terminal cleanup.
 - GitHub driver tests verify issue polling dedupes tasks, GitHub-mode issue tasks are auto-published as PRs, and PRs needing attention are refreshed and steered back into the original waiting task for same-task follow-up.
 - Discord driver tests verify startup history skipping, direct task creation, assistant-suggested `do it` task creation, and fallback task creation when the assistant cannot answer conversationally.
 - Project tests verify SQLite persistence, startup seeding/loading, runtime API creation, explicit `projectId` routing, external repo-to-project mapping, and PR publishing defaults from project repo/base settings.
