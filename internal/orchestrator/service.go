@@ -2416,13 +2416,28 @@ func (s *Service) runPlannedWorker(ctx context.Context, task core.Task, plan Pla
 	if err != nil {
 		return WorkerTurnResult{}, err
 	}
-	s.targets.Begin(target.ID)
-	defer s.targets.Finish(target.ID)
 	plan.Metadata["targetID"] = target.ID
 	plan.Metadata["targetKind"] = string(target.Kind)
 	if target.Kind == TargetKindSSH {
-		return s.runSSHPlannedWorker(ctx, task, plan, runner, target)
+		s.targets.Begin(target.ID)
+		result, err := s.runSSHPlannedWorker(ctx, task, plan, runner, target)
+		s.targets.Finish(target.ID)
+		if err == nil || !isRemotePreStartFallbackError(err) {
+			return result, err
+		}
+		fallback, fallbackErr := s.targets.SelectLocalFallback()
+		if fallbackErr != nil {
+			return result, err
+		}
+		plan.Metadata["fallbackFromTargetID"] = target.ID
+		plan.Metadata["fallbackFromTargetKind"] = string(target.Kind)
+		plan.Metadata["fallbackReason"] = err.Error()
+		plan.Metadata["targetID"] = fallback.ID
+		plan.Metadata["targetKind"] = string(fallback.Kind)
+		target = fallback
 	}
+	s.targets.Begin(target.ID)
+	defer s.targets.Finish(target.ID)
 
 	workerID := uuid.NewString()
 	nodeID := stringMetadata(plan.Metadata, "nodeID")
@@ -2680,6 +2695,13 @@ func (s *Service) executionTargetForWorker(ctx context.Context, workerID string)
 	}
 	target, err := s.targets.SelectID(targetID)
 	return target, true, err
+}
+
+func isRemotePreStartFallbackError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "prepare remote checkout:")
 }
 
 func (s *Service) runSSHPlannedWorker(ctx context.Context, task core.Task, plan Plan, runner worker.Runner, target TargetConfig) (WorkerTurnResult, error) {
@@ -4756,6 +4778,8 @@ func planMetadata(plan Plan) map[string]any {
 		"ignoredTargetLabels",
 		"targetSelectionPolicy",
 		"targetSelectionSource",
+		"fallbackFromTargetID",
+		"fallbackFromTargetKind",
 		"remoteSession",
 		"remoteRunDir",
 		"remoteWorkDir",

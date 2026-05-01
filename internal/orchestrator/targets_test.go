@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -312,16 +313,63 @@ func TestServiceRunsWorkerOnRealSSHTarget(t *testing.T) {
 	}
 }
 
+func TestServiceFallsBackToLocalWhenRemoteCheckoutIsDirty(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	defer store.Close()
+
+	targets := NewTargetRegistry([]TargetConfig{{
+		ID:       "vm-dirty",
+		Kind:     TargetKindSSH,
+		Host:     "vm-dirty",
+		WorkDir:  "/home/exedev/deno",
+		Capacity: TargetCapacity{MaxWorkers: 1, CPUWeight: 100},
+	}})
+	executor := &fakeRemoteExecutor{
+		prepareOutput: "remote checkout is dirty: /home/exedev/deno",
+		prepareErr:    errors.New("exit status 20"),
+	}
+	service := NewServiceWithWorkspaceManagerAndTargets(store, fixedBrain{plan: Plan{
+		WorkerKind: "mock",
+		Prompt:     "run work",
+		Metadata: map[string]any{
+			"workerSize": "large",
+		},
+	}}, map[string]worker.Runner{
+		"mock": eventRunner{kind: "mock"},
+	}, t.TempDir(), fakeWorkspaceManager{cwd: t.TempDir()}, targets, SSHRunner{Executor: executor, PollInterval: time.Millisecond})
+
+	task, err := service.CreateTask(ctx, core.CreateTaskRequest{Title: "Fallback", Prompt: "Run with remote fallback."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot := waitForTaskStatus(t, store, task.ID, core.TaskSucceeded)
+	if len(snapshot.ExecutionNodes) != 1 {
+		t.Fatalf("nodes = %+v", snapshot.ExecutionNodes)
+	}
+	node := snapshot.ExecutionNodes[0]
+	if node.TargetID != "local" || node.TargetKind != "local" {
+		t.Fatalf("node = %+v, want local fallback", node)
+	}
+	if !hasEventPayloadValue(snapshot.Events, core.EventWorkerCreated, task.ID, "fallbackFromTargetID", "vm-dirty") {
+		t.Fatalf("missing fallback metadata")
+	}
+}
+
 type fakeRemoteExecutor struct {
-	commands    [][]string
-	probeOutput string
-	input       string
+	commands      [][]string
+	probeOutput   string
+	prepareOutput string
+	prepareErr    error
+	input         string
 }
 
 func (e *fakeRemoteExecutor) Run(_ context.Context, argv []string) (string, error) {
 	e.commands = append(e.commands, append([]string(nil), argv...))
 	joined := strings.Join(argv, " ")
 	switch {
+	case e.prepareErr != nil && strings.Contains(joined, "git clone"):
+		return e.prepareOutput, e.prepareErr
 	case strings.Contains(joined, "repoPresent="):
 		if e.probeOutput != "" {
 			return e.probeOutput, nil

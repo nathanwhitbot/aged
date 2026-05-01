@@ -249,6 +249,32 @@ func (r *TargetRegistry) SelectID(id string) (TargetConfig, error) {
 	return target, nil
 }
 
+func (r *TargetRegistry) SelectLocalFallback() (TargetConfig, error) {
+	if r == nil {
+		return TargetConfig{}, errors.New("target registry is not configured")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, target := range r.targets {
+		if target.Kind == TargetKindLocal && r.isAvailableLocked(target) {
+			return target, nil
+		}
+	}
+	if _, ok := r.targets["local"]; ok {
+		return TargetConfig{}, errors.New("local execution target is at capacity")
+	}
+	target := TargetConfig{
+		ID:   "local",
+		Kind: TargetKindLocal,
+		Labels: map[string]string{
+			"location": "local",
+		},
+		Capacity: TargetCapacity{MaxWorkers: 16, CPUWeight: 1},
+	}
+	r.targets[target.ID] = target
+	return target, nil
+}
+
 func (r *TargetRegistry) Get(id string) (TargetConfig, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
