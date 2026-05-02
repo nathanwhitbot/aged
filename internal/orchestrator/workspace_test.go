@@ -126,6 +126,25 @@ func TestParseGitPorcelain(t *testing.T) {
 	}
 }
 
+func TestParseGitNameStatus(t *testing.T) {
+	files := parseGitNameStatus("M\x00internal/orchestrator/service.go\x00A\x00web/src/types.ts\x00R100\x00old.txt\x00new.txt\x00")
+	if len(files) != 4 {
+		t.Fatalf("files = %+v", files)
+	}
+	if files[0] != (WorkspaceChangedFile{Path: "internal/orchestrator/service.go", Status: "modified"}) {
+		t.Fatalf("first file = %+v", files[0])
+	}
+	if files[1] != (WorkspaceChangedFile{Path: "web/src/types.ts", Status: "added"}) {
+		t.Fatalf("second file = %+v", files[1])
+	}
+	if files[2] != (WorkspaceChangedFile{Path: "old.txt", Status: "renamed_from"}) {
+		t.Fatalf("third file = %+v", files[2])
+	}
+	if files[3] != (WorkspaceChangedFile{Path: "new.txt", Status: "renamed"}) {
+		t.Fatalf("fourth file = %+v", files[3])
+	}
+}
+
 func TestJJWorkspaceManagerDescribesIsolatedWorkerCommit(t *testing.T) {
 	repo := initJJTestRepo(t)
 	manager := NewJJWorkspaceManager(WorkspaceModeIsolated, t.TempDir(), WorkspaceCleanupRetain)
@@ -358,6 +377,62 @@ func TestGitWorkspaceManagerCopiesCommittedBaseCandidateWithDirtyFollowUp(t *tes
 	nameStatus := strings.TrimSpace(runTestGit(t, reviewer.CWD, "diff", "--name-status", "HEAD~1", "HEAD", "--"))
 	if !strings.Contains(nameStatus, "A\t.github/workflows/ci.yml") || !strings.Contains(nameStatus, "M\tfile.txt") {
 		t.Fatalf("reviewer base commit changes = %q", nameStatus)
+	}
+}
+
+func TestGitWorkspaceManagerDescribesCommittedBaseCandidateChanges(t *testing.T) {
+	ctx := context.Background()
+	repo := initGitTestRepo(t)
+	manager := NewGitWorkspaceManager(WorkspaceModeIsolated, t.TempDir(), WorkspaceCleanupRetain)
+
+	base, err := manager.Prepare(ctx, WorkspaceSpec{
+		TaskID:   "task",
+		WorkerID: "base-worker",
+		WorkDir:  repo,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(base.CWD, ".github", "workflows"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(base.CWD, ".github", "workflows", "ci.yml"), []byte("name: CI\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reviewer, err := manager.Prepare(ctx, WorkspaceSpec{
+		TaskID:      "task",
+		WorkerID:    "reviewer-worker",
+		WorkDir:     repo,
+		BaseWorkDir: base.CWD,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := strings.TrimSpace(runTestGit(t, reviewer.CWD, "status", "--porcelain=v1"))
+	if status != "" {
+		t.Fatalf("reviewer git status = %q, want clean", status)
+	}
+
+	changes, err := manager.DescribeChanges(ctx, reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes.Dirty {
+		t.Fatal("committed base candidate should be reported as dirty relative to project base")
+	}
+	if len(changes.ChangedFiles) != 1 || changes.ChangedFiles[0] != (WorkspaceChangedFile{Path: ".github/workflows/ci.yml", Status: "added"}) {
+		t.Fatalf("changed files = %+v", changes.ChangedFiles)
+	}
+	if !strings.Contains(changes.DiffStat, ".github/workflows/ci.yml") {
+		t.Fatalf("diff stat = %q", changes.DiffStat)
+	}
+	diff, err := manager.DescribeDiff(ctx, reviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(diff, "diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml") {
+		t.Fatalf("diff does not include committed candidate file:\n%s", diff)
 	}
 }
 

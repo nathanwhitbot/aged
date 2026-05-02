@@ -695,21 +695,38 @@ func (m GitWorkspaceManager) DescribeChanges(ctx context.Context, workspace Prep
 		return changes, fmt.Errorf("read git workspace status: %w", err)
 	}
 	changes.Status = strings.TrimSpace(status)
-	changes.Dirty = gitStatusDirty(changes.Status)
 
-	diffStat, err := runGit(ctx, workspace.CWD, "diff", "--stat", "HEAD", "--")
+	baseRef, err := gitWorkspaceDiffBase(ctx, workspace)
+	if err != nil {
+		changes.Error = err.Error()
+		return changes, err
+	}
+	diffStat, err := runGit(ctx, workspace.CWD, "diff", "--stat", baseRef, "--")
 	if err != nil {
 		changes.Error = err.Error()
 		return changes, fmt.Errorf("read git workspace diff stat: %w", err)
 	}
 	changes.DiffStat = strings.TrimSpace(diffStat)
 
-	porcelain, err := runGit(ctx, workspace.CWD, "status", "--porcelain=v1")
+	nameStatus, err := runGit(ctx, workspace.CWD, "diff", "--name-status", "-z", baseRef, "--")
 	if err != nil {
 		changes.Error = err.Error()
 		return changes, fmt.Errorf("read git workspace changed files: %w", err)
 	}
-	changes.ChangedFiles = parseGitPorcelain(porcelain)
+	changedFiles := parseGitNameStatus(nameStatus)
+	untracked, err := runGit(ctx, workspace.CWD, "ls-files", "--others", "--exclude-standard")
+	if err != nil {
+		changes.Error = err.Error()
+		return changes, fmt.Errorf("read git workspace untracked files: %w", err)
+	}
+	for _, path := range strings.Split(untracked, "\n") {
+		path = strings.TrimSpace(path)
+		if path != "" {
+			changedFiles = append(changedFiles, WorkspaceChangedFile{Path: path, Status: "untracked"})
+		}
+	}
+	changes.ChangedFiles = changedFiles
+	changes.Dirty = gitStatusDirty(changes.Status) || changes.DiffStat != "" || len(changes.ChangedFiles) > 0
 	return changes, nil
 }
 
@@ -717,7 +734,11 @@ func (m GitWorkspaceManager) DescribeDiff(ctx context.Context, workspace Prepare
 	if workspace.CWD == "" {
 		return "", errors.New("workspace cwd is required")
 	}
-	diff, err := runGit(ctx, workspace.CWD, "diff", "--binary", "HEAD", "--")
+	baseRef, err := gitWorkspaceDiffBase(ctx, workspace)
+	if err != nil {
+		return "", err
+	}
+	diff, err := runGit(ctx, workspace.CWD, "diff", "--binary", baseRef, "--")
 	if err != nil {
 		return "", err
 	}
@@ -739,6 +760,17 @@ func (m GitWorkspaceManager) DescribeDiff(ctx context.Context, workspace Prepare
 		builder.WriteString(fileDiff)
 	}
 	return builder.String(), nil
+}
+
+func gitWorkspaceDiffBase(ctx context.Context, workspace PreparedWorkspace) (string, error) {
+	baseRef := strings.TrimSpace(workspace.BaseChange)
+	if baseRef == "" {
+		return "HEAD", nil
+	}
+	if _, err := runGit(ctx, workspace.CWD, "rev-parse", "--verify", "--quiet", baseRef+"^{commit}"); err != nil {
+		return "", fmt.Errorf("verify git workspace base %q: %w", baseRef, err)
+	}
+	return baseRef, nil
 }
 
 func (m GitWorkspaceManager) ApplyChanges(ctx context.Context, workspace PreparedWorkspace, changes WorkspaceChanges) (WorkerApplyResult, error) {
@@ -1116,6 +1148,42 @@ func parseGitPorcelain(status string) []WorkspaceChangedFile {
 			path = after
 		}
 		files = append(files, WorkspaceChangedFile{Path: path, Status: normalizeChangeStatus(code)})
+	}
+	return files
+}
+
+func parseGitNameStatus(nameStatus string) []WorkspaceChangedFile {
+	var files []WorkspaceChangedFile
+	fields := strings.Split(nameStatus, "\x00")
+	for i := 0; i < len(fields); {
+		status := fields[i]
+		i++
+		if status == "" {
+			continue
+		}
+		if i >= len(fields) {
+			break
+		}
+		path := fields[i]
+		i++
+		if path == "" {
+			continue
+		}
+		if strings.HasPrefix(status, "R") || strings.HasPrefix(status, "C") {
+			if i >= len(fields) {
+				break
+			}
+			nextPath := fields[i]
+			i++
+			if strings.HasPrefix(status, "R") {
+				files = append(files, WorkspaceChangedFile{Path: path, Status: "renamed_from"})
+				files = append(files, WorkspaceChangedFile{Path: nextPath, Status: "renamed"})
+			} else {
+				files = append(files, WorkspaceChangedFile{Path: nextPath, Status: "added"})
+			}
+			continue
+		}
+		files = append(files, WorkspaceChangedFile{Path: path, Status: normalizeChangeStatus(status)})
 	}
 	return files
 }
