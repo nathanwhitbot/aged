@@ -103,12 +103,7 @@ func (s *Server) snapshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) projects(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := s.service.Snapshot(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snapshot.Projects)
+	s.writeSnapshotValue(w, r, func(snapshot core.Snapshot) any { return snapshot.Projects })
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
@@ -139,12 +134,7 @@ func (s *Server) projectHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) targets(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := s.service.Snapshot(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snapshot.Targets)
+	s.writeSnapshotValue(w, r, func(snapshot core.Snapshot) any { return snapshot.Targets })
 }
 
 func (s *Server) registerTarget(w http.ResponseWriter, r *http.Request) {
@@ -194,12 +184,7 @@ func (s *Server) deleteTarget(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) plugins(w http.ResponseWriter, r *http.Request) {
-	snapshot, err := s.service.Snapshot(r.Context())
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, snapshot.Plugins)
+	s.writeSnapshotValue(w, r, func(snapshot core.Snapshot) any { return snapshot.Plugins })
 }
 
 func (s *Server) registerPlugin(w http.ResponseWriter, r *http.Request) {
@@ -412,6 +397,15 @@ func decodeJSON(r *http.Request, out any) error {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	return decoder.Decode(out)
+}
+
+func (s *Server) writeSnapshotValue(w http.ResponseWriter, r *http.Request, selectValue func(core.Snapshot) any) {
+	snapshot, err := s.service.Snapshot(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, selectValue(snapshot))
 }
 
 func decodeRequest[T any](w http.ResponseWriter, r *http.Request) (T, bool) {
