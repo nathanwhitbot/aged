@@ -1205,7 +1205,7 @@ func TestServiceCompletionReadinessRecoveryAcceptsValidationWorker(t *testing.T)
 	}
 }
 
-func TestValidatesBlockedCandidateRequiresLineage(t *testing.T) {
+func TestValidatesBlockedCandidateRequiresLineageAndOrdering(t *testing.T) {
 	results := []WorkerTurnResult{
 		{
 			WorkerID: "blocked-impl",
@@ -1237,6 +1237,11 @@ func TestValidatesBlockedCandidateRequiresLineage(t *testing.T) {
 	}
 	if !validatesBlockedCandidate(results, "related-validation", "blocked-impl") {
 		t.Fatalf("related no-change worker did not validate blocked candidate through BaseWorkerID lineage")
+	}
+
+	outOfOrder := append([]WorkerTurnResult{results[2]}, results[:2]...)
+	if validatesBlockedCandidate(outOfOrder, "related-validation", "blocked-impl") {
+		t.Fatalf("out-of-order no-change worker validated blocked candidate")
 	}
 }
 
@@ -5359,6 +5364,9 @@ func TestCancelTaskAfterRestartReconstructsWorkersFromSnapshot(t *testing.T) {
 	}
 	if status := taskStatus(snapshot, taskID); status != core.TaskCanceled {
 		t.Fatalf("task status = %q, want canceled", status)
+	}
+	if !hasEventPayloadValue(snapshot.Events, core.EventWorkerCompleted, taskID, "summary", "Worker was canceled from persisted execution node state.") {
+		t.Fatalf("missing persisted execution-node cancellation event for worker without row")
 	}
 }
 

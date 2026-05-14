@@ -5125,8 +5125,19 @@ func validatesBlockedCandidate(results []WorkerTurnResult, selectedWorkerID stri
 		return false
 	}
 	byID := map[string]WorkerTurnResult{}
-	for _, result := range results {
+	selectedIndex := -1
+	blockedIndex := -1
+	for i, result := range results {
 		byID[result.WorkerID] = result
+		if result.WorkerID == selectedWorkerID {
+			selectedIndex = i
+		}
+		if result.WorkerID == blockedWorkerID {
+			blockedIndex = i
+		}
+	}
+	if selectedIndex <= blockedIndex || blockedIndex == -1 {
+		return false
 	}
 	selected, ok := byID[selectedWorkerID]
 	if !ok || selected.Status != core.WorkerSucceeded || resultHasCandidateChanges(selected) {
